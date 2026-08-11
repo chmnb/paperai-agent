@@ -1,5 +1,5 @@
 """LLM 大模型客户端模块"""
-from typing import Optional, List
+from typing import Optional, List, AsyncGenerator
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 from app.config import settings
@@ -44,6 +44,16 @@ class LLMClient:
             return LLMResult(results)
         except Exception as e:
             logger.error(f"LLM 调用失败: {e}")
+            raise
+
+    async def astream(self, prompt: str) -> AsyncGenerator[str, None]:
+        """流式生成，逐 token yield"""
+        try:
+            async for chunk in self.client.astream([HumanMessage(content=prompt)]):
+                if chunk.content:
+                    yield chunk.content
+        except Exception as e:
+            logger.error(f"LLM 流式调用失败: {e}")
             raise
 
 
