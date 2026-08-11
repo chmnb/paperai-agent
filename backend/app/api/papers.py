@@ -1,11 +1,14 @@
 """论文 API 模块"""
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Header, Query
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, delete
 from typing import Optional
 import os
 import uuid
+import json
 import pdfplumber
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from app.database import get_db
 from app.models.paper import Paper, Section, QAPair
@@ -145,7 +148,40 @@ async def upload_paper(file: UploadFile = File(...), authorization: str = Header
     # 添加到向量库 (失败不影响上传)
     try:
         kb = get_knowledge_base()
-        chunks = [{"content": raw_text[i:i+1000], "type": "text", "index": i // 1000, "section": ""} for i in range(0, min(len(raw_text), 100000), 1000)]
+        text = raw_text[:100000]
+
+        # 使用 RecursiveCharacterTextSplitter 按语义边界切分
+        # 分隔符优先级: 段落 → 换行 → 句号 → 空格 → 字符
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=500,
+            chunk_overlap=100,
+            separators=["\n\n", "\n", ". ", " ", ""],
+        )
+
+        # 尝试按 LLM 解析出的章节分段，有章节信息则优先按章节边界切
+        doc_chunks = splitter.create_documents([text])
+        chunks = [
+            {
+                "content": chunk.page_content,
+                "type": "text",
+                "index": i,
+                "section": "",  # 后续可从 parse_result 匹配章节
+            }
+            for i, chunk in enumerate(doc_chunks)
+        ]
+
+        # 将每个 chunk 关联到最近的章节标题
+        sections = parse_result.get("sections", [])
+        for chunk_data in chunks:
+            chunk_text = chunk_data["content"][:60]
+            for sec in sections:
+                if sec.get("title") and sec["title"][:10] in raw_text:
+                    sec_start = raw_text.find(sec["title"])
+                    chunk_start = raw_text.find(chunk_data["content"])
+                    if chunk_start >= sec_start:
+                        chunk_data["section"] = sec.get("title", "")
+                        break
+
         await kb.add_paper_chunks(paper_id, chunks)
     except Exception:
         pass
@@ -173,3 +209,76 @@ async def ask_question(paper_id: str, data: dict, authorization: str = Header(No
     return {"answer": result.get("answer"), "intent": result.get("intent"),
             "sources": result.get("sources", []), "confidence": result.get("confidence"),
             "qa_id": str(qa_pair.id)}
+
+
+@router.post("/{paper_id}/qa/stream")
+async def ask_question_stream(paper_id: str, data: dict, authorization: str = Header(None), db: AsyncSession = Depends(get_db)):
+    """流式问答端点，SSE 逐字返回答案"""
+    user_id = await get_current_user_id(authorization)
+    question = data.get("question")
+    if not question:
+        raise HTTPException(status_code=400, detail="问题不能为空")
+
+    result = await db.execute(select(Paper).where(Paper.id == paper_id, Paper.user_id == user_id))
+    if not result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="论文不存在")
+
+    # 1. 意图识别（快速，非流式）
+    from app.llm.client import get_llm_client
+    llm = get_llm_client()
+    intent_prompt = f"""分析以下关于论文的问题，判断其意图类型：
+问题：{question}
+意图类型：concept/method/experiment/code/general
+返回 JSON 格式：{{"intent": "意图类型", "confidence": 0.9}}"""
+    try:
+        intent_result = await llm.generate([intent_prompt])
+        text = intent_result.generations[0][0].text.strip()
+        if "```json" in text: text = text.split("```json")[1].split("```")[0]
+        intent_data = json.loads(text.strip())
+        intent = intent_data.get("intent", "general")
+    except Exception:
+        intent = "general"
+
+    # 2. 检索（快速，非流式）
+    kb = get_knowledge_base()
+    chunks = await kb.query(paper_id, question, top_k=5)
+
+    context = "\n\n".join([f"[片段{i+1}] {c.get('content', '')}" for i, c in enumerate(chunks[:3])]) if chunks else "未找到相关信息。"
+
+    intent_prompts = {
+        "concept": "请给出清晰、准确的概念解释。",
+        "method": "请详细分析论文使用的方法，并解释其原理。",
+        "experiment": "请分析实验结果并给出专业评价。",
+        "code": "请给出简洁、可运行的实现代码。",
+        "general": "请给出准确、全面的回答。"
+    }
+
+    prompt = f"""基于以下论文内容回答问题：
+问题：{question}
+参考内容：{context}
+{intent_prompts.get(intent, intent_prompts["general"])}"""
+
+    # 3. 流式生成答案
+    async def generate_stream():
+        full_answer = ""
+        try:
+            async for token in llm.astream(prompt):
+                full_answer += token
+                yield f"data: {json.dumps({'token': token})}\n\n"
+        except Exception:
+            yield f"data: {json.dumps({'token': '[生成出错]'})}\n\n"
+        finally:
+            # 保存问答记录
+            if full_answer:
+                try:
+                    qa_pair = QAPair(paper_id=paper_id, order_index=1, question=question,
+                        answer=full_answer, chunk_context=context[:500],
+                        relevance_score=0.8)
+                    db.add(qa_pair)
+                    await db.commit()
+                    yield f"data: {json.dumps({'done': True, 'intent': intent, 'qa_id': str(qa_pair.id)})}\n\n"
+                except Exception:
+                    yield f"data: {json.dumps({'done': True, 'intent': intent})}\n\n"
+
+    return StreamingResponse(generate_stream(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
